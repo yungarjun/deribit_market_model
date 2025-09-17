@@ -23,3 +23,5 @@ cabal.sandbox.config
 *.pkl
 *.haddock
 *.pyc
+*.jsonl
+*.DS_Store

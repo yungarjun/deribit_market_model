@@ -1,11 +1,13 @@
 import pandas as pd
 import numpy as np
+import json
+from pandas import json_normalize
 
 def read_parquet(path: str) -> pd.DataFrame:
     import pyarrow.parquet as pq
     return pq.read_table(path).to_pandas()
 
-def clean_deribit(df: pd.DataFrame, reference_date="2025-01-30", r=0.0, q=0.0) -> pd.DataFrame:
+def clean_deribit(df: pd.DataFrame, reference_date, r=0.0, q=0.0) -> pd.DataFrame:
     """
     - Splits instrument_name into asset/expiry/strike/type
     - Builds τ (in years, 365*24*3600 continuous trading)
@@ -41,3 +43,19 @@ def clean_deribit(df: pd.DataFrame, reference_date="2025-01-30", r=0.0, q=0.0) -
     # Drop nonsense
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['tau', 'm', 'c_norm', 'underlying_price'])
     return df
+
+# Reading in jsonl file
+def read_clean_jsonl(file_path):
+    file = pd.read_json(file_path, lines = True)
+
+    # Convert timestamp column to datetime
+    file['timestamp'] = pd.to_datetime(
+    file['timestamp'],
+    format='%Y-%m-%d %H:%M:%S.%f'  # speeds up parsing, optional
+    )
+
+    stats_df = json_normalize(file['stats']).add_prefix('stats_')
+
+    file = file.join(stats_df).drop(columns = ['stats'])
+
+    return file
