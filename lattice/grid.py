@@ -176,3 +176,23 @@ def apply_lattice_test(df: pd.DataFrame, lat: Lattice, train_keep_idx, fill_meth
     m_sub     = {float(t): np.sort(nodes_sub[nodes_sub[:,0]==t,1]) for t in tau_sub}
 
     return C, nodes_sub, tau_sub, m_sub
+
+def ensure_consistent_lattice(Ci_test, Ci_train, keep_idx, nodes_sub):
+    """"
+    Drops columns that are dead in the test lattice
+    Because they don't appear
+    """
+    dead_cols = Ci_test.columns[Ci_test.isna().all(axis=0)]
+    
+    # shrink nodes_sub and matrices
+    pos_mask = ~np.isin(keep_idx, dead_cols)
+    keep_idx_2 = keep_idx[pos_mask]
+    nodes_sub2 = nodes_sub[pos_mask]
+
+    tau_sub2 = np.unique(nodes_sub2[:, 0])
+    m_sub2 = {float(t): np.sort(nodes_sub2[nodes_sub2[:,0]==t, 1]) for t in tau_sub2}
+
+    Ci_train2 = Ci_train.loc[:, keep_idx_2]
+    Ci_test2  = Ci_test.loc[:,  keep_idx_2]
+
+    return Ci_test2, Ci_train2, nodes_sub2, tau_sub2, m_sub2

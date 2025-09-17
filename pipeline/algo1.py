@@ -5,7 +5,7 @@ from typing import Optional
 
 from config import Algo1Config, DecoderKind
 from type import Lattice, Surfaces
-from lattice.grid import build_lattice_grid, apply_lattice_train, apply_lattice_test
+from lattice.grid import build_lattice_grid, apply_lattice_train, apply_lattice_test, ensure_consistent_lattice
 from lattice.noarb import build_noarb_constraints, project_noarb, reduce_constraints_geq
 from surfaces.derivatives import compute_derivatives
 from stage0.train import make_stage0_dataset, train_stage0, sigma_to_gamma
@@ -127,6 +127,8 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date="20
     # train
     Ci_test,  _,         _,      _      = apply_lattice_test(test_df, lat, keep_idx)
 
+    # Ensuring consistent lattice between test and train
+    Ci_test, Ci_train, nodes_sub, tau_sub, m_sub = ensure_consistent_lattice(Ci_test, Ci_train, keep_idx, nodes_sub)
 
     # static projection
     ab = build_noarb_constraints(nodes_sub, tau_sub, m_sub)
