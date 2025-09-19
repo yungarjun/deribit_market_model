@@ -145,8 +145,16 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date="20
     pca_price, net0, scaler0, sigma_train, sigma_test, gamma_train, gamma_test = _stage0_block(C_train, C_test, train_df, test_df, cfg)
 
     # Z field
-    Z_train = build_Z(dCtau_train, dCm_train, d2Cm2_train, gamma_train, drop_last=True)
-    Z_test  = build_Z(dCtau_test,  dCm_test,  d2Cm2_test,  gamma_test,  drop_last=True)
+    # Z_train = build_Z(dCtau_train, dCm_train, d2Cm2_train, gamma_train, drop_last=True)
+    # Z_test  = build_Z(dCtau_test,  dCm_test,  d2Cm2_test,  gamma_test,  drop_last=True)
+
+    # Z 
+    Z_train_full = (dCtau_train[:-1] - 0.5 * (gamma_train[:, None]**2) * (d2Cm2_train[:-1] - dCm_train[:-1]))
+    Z_test_full  = (dCtau_test[:-1]
+                - 0.5 * (gamma_test[:,  None]**2) * (d2Cm2_test[:-1]  - dCm_test[:-1]))
+    
+    Z_train = Z_train_full
+    Z_test  = Z_test_full
 
     # G0 & factor extraction (dyn, stat)
     G0 = C_train.mean(axis=0).values
@@ -179,33 +187,123 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date="20
         G_sa = np.zeros((0, C_train.shape[1])); Xi_sa_train = np.zeros((C_train.shape[0]-1, 0)); Xi_sa_test = np.zeros((C_test.shape[0]-1, 0))
     else:
         # PCA-based dyn/stat + hinge static-arb decoding (Wang)
-        pca_dyn, G_dyn = pca_dyn_block(Z_train, cfg.dda, cfg.seed)
-        R0_prices_train = C_train.values - G0[None, :]
-        R0_prices_test  = C_test.values  - G0[None, :]
+        # pca_dyn, G_dyn = pca_dyn_block(Z_train, cfg.dda, cfg.seed)
+        pca_dyn = PCA(n_components = cfg.dda, random_state=cfg.seed).fit(Z_train)
+        G_dyn = pca_dyn.components_
+ 
+        # Xi_dyn_train = R0_prices_train @ G_dyn.T
+        # Xi_dyn_test  = R0_prices_test  @ G_dyn.T
+        # Xi_dyn_train = pca_dyn.transform(Z_train)
+        # Xi_dyn_test = pca_dyn.transform(Z_test)
+        
+        # Prep price residuals aligned to Xi_dyn (drop last time so shapes match)
+        C_train_arr = C_train.values[: -1]
+        C_test_arr = C_test.values[:-1]
+        # G0 = C_train.mean(axis=0).values
+        R0_prices_train = C_train_arr - G0[None, :]
+        R0_prices_test  = C_test_arr  - G0[None, :]
         Xi_dyn_train = R0_prices_train @ G_dyn.T
         Xi_dyn_test  = R0_prices_test  @ G_dyn.T
+
+        # Removing dynamic arbitrage contribution using Z-based scores
         R_dda_train = R0_prices_train - Xi_dyn_train @ G_dyn
-        pca_stat, G_stat = pca_stat_block(R_dda_train, cfg.dst, cfg.seed)
-        Xi_stat_train = R_dda_train @ G_stat.T
-        Xi_stat_test = (R0_prices_test - Xi_dyn_test @ G_dyn) @ G_stat.T
+        R_dda_test = R0_prices_test - Xi_dyn_test @ G_dyn
+        
+        # ----- Statistical Accuracy Factors on dynamic residual ------
+        pca_stat = PCA(n_components=cfg.dst, random_state=cfg.seed).fit(R_dda_train)
+        G_stat = pca_stat.components_
+        Xi_stat_train = pca_stat.transform(R_dda_train)
+        Xi_stat_test  = pca_stat.transform(R_dda_test)
+
+        # R_dda_train = R0_prices_train - Xi_dyn_train @ G_dyn
+        # pca_stat, G_stat = pca_stat_block(R_dda_train, cfg.dst, cfg.seed)
+        # Xi_stat_train = R_dda_train @ G_stat.T
+        # Xi_stat_test = (R0_prices_test - Xi_dyn_test @ G_dyn) @ G_stat.T
 
         Recon_sofar_train = Xi_dyn_train @ G_dyn + Xi_stat_train @ G_stat
+        R_sa_train = R0_prices_train - Recon_sofar_train
         G_sa, Xi_sa_train, _W = decode_static_arb_hinge(
-            R_sa_train=R0_prices_train - Recon_sofar_train,
+            R_sa_train=R_sa_train,
             G0=G0, Recon_sofar=Recon_sofar_train,
             A=A, b=b, n_sa=cfg.n_sa, n_PC=cfg.n_PC_sa,
             lam_rec=cfg.lam_rec, lam_hinge=cfg.lam_hinge, maxfun=8000, seed=cfg.seed
         )
-        Xi_sa_test = (R0_prices_test - (Xi_dyn_test @ G_dyn + Xi_stat_test @ G_stat)) @ np.linalg.pinv(G_sa)
+        # Xi_sa_test = (R0_prices_test - (Xi_dyn_test @ G_dyn + Xi_stat_test @ G_stat)) @ np.linalg.pinv(G_sa)
+        Recon_sofar_test = Xi_dyn_test @ G_dyn + Xi_stat_test @ G_stat
+        Xi_sa_test = (R0_prices_test - Recon_sofar_test) @ np.linalg.pinv(G_sa)
+
+        # ------- Building Stacks (train / test) ------
+        Xi_train_stack = np.hstack([
+            Xi_dyn_train,
+            Xi_stat_train,
+            Xi_sa_train if cfg.n_sa>0 else np.zeros((Xi_dyn_train.shape[0],0))
+        ])
+
+        Xi_test_stack = np.hstack([
+            Xi_dyn_test,
+            Xi_stat_test,
+            Xi_sa_test if cfg.n_sa>0 else np.zeros((Xi_dyn_test.shape[0], 0))
+        ])  # shape: (T_test-1, p)
+
+        G_stack = np.vstack([
+            G_dyn,
+            G_stat,
+            G_sa if cfg.n_sa > 0 else np.zeros((), C_train.shape[1])
+        ])
+
+        p = Xi_train_stack.shape[1]
+        if p > 0:
+                # PCA on scores (train) to orthogonalise
+            pca_scores = PCA(n_components=p, random_state=cfg.seed).fit(Xi_train_stack)
+            H = pca_scores.components_                 # (p, p) rotation
+
+            # rotate scores
+            Xi_train_orth = pca_scores.transform(Xi_train_stack)        # (T-1, p)
+            Xi_test_orth  = (Xi_test_stack - pca_scores.mean_) @ H.T    # (T_test-1, p)
+
+            # rotate loadings (skip G0!)
+            G_stack_rot = H @ G_stack                                    # (p, N)
+
+            # split back into blocks
+            i = 0
+            G_dyn_rot           = G_stack_rot[i:i+cfg.dda];           i += cfg.dda
+            G_stat_rot          = G_stack_rot[i:i+cfg.dst];           i += cfg.dst
+            G_sa_rot            = G_stack_rot[i:i+cfg.n_sa] if cfg.n_sa>0 else np.zeros((0, G_stack.shape[1]))
+
+            i = 0
+            Xi_dyn_train_orth   = Xi_train_orth[:, i:i+cfg.dda];      i += cfg.dda
+            Xi_stat_train_orth  = Xi_train_orth[:, i:i+cfg.dst];      i += cfg.dst
+            Xi_sa_train_orth    = Xi_train_orth[:, i:i+cfg.n_sa] if cfg.n_sa>0 else np.zeros((Xi_train_orth.shape[0],0))
+
+            i = 0
+            Xi_dyn_test_orth    = Xi_test_orth[:, i:i+cfg.dda];       i += cfg.dda
+            Xi_stat_test_orth   = Xi_test_orth[:, i:i+cfg.dst];       i += cfg.dst
+            Xi_sa_test_orth     = Xi_test_orth[:, i:i+cfg.n_sa] if cfg.n_sa>0 else np.zeros((Xi_test_orth.shape[0],0))
+        else:
+    # no factors case
+            G_dyn_rot=G_dyn; G_stat_rot=G_stat; G_sa_rot=G_sa
+            Xi_dyn_train_orth=Xi_dyn_train; Xi_stat_train_orth=Xi_stat_train; Xi_sa_train_orth=Xi_sa_train
+            Xi_dyn_test_orth=Xi_dyn_test; Xi_stat_test_orth=Xi_stat_test; Xi_sa_test_orth=Xi_sa_test
 
     # recon + metrics
-    C_hat_train = reconstruct_prices(G0, Xi_dyn_train, G_dyn, Xi_stat_train, G_stat, Xi_sa_train, G_sa)
-    C_hat_test  = reconstruct_prices(G0, Xi_dyn_test,  G_dyn, Xi_stat_test,  G_stat, Xi_sa_test,  G_sa)
+    # C_hat_train = reconstruct_prices(G0, Xi_dyn_train, G_dyn, Xi_stat_train, G_stat, Xi_sa_train, G_sa)
+    # C_hat_test  = reconstruct_prices(G0, Xi_dyn_test,  G_dyn, Xi_stat_test,  G_stat, Xi_sa_test,  G_sa)
 
-    MAPE_train = mape(C_train.values, C_hat_train)
-    MAPE_test  = mape(C_test.values,  C_hat_test)
-    VW_MAPE_train = vega_weighted_mape(C_train.values, C_hat_train, nodes_sub, power = 1.0)
-    VW_MAPE_test = vega_weighted_mape(C_test.values, C_hat_test, nodes_sub, power = 1.0)
+    # reconstruction on the aligned (T-1) panel
+    C_hat_train = (G0[None, :]
+                + Xi_dyn_train_orth  @ G_dyn_rot
+                + Xi_stat_train_orth @ G_stat_rot
+                + (Xi_sa_train_orth  @ G_sa_rot if cfg.n_sa>0 else 0.0))
+
+    C_hat_test = (G0[None, :]
+                + Xi_dyn_test_orth  @ G_dyn_rot
+                + Xi_stat_test_orth @ G_stat_rot
+                + (Xi_sa_test_orth  @ G_sa_rot if cfg.n_sa>0 else 0.0))
+
+    MAPE_train = mape(C_train.values[:-1], C_hat_train)
+    MAPE_test  = mape(C_test.values[:-1],  C_hat_test)
+    VW_MAPE_train = vega_weighted_mape(C_train.values[:-1], C_hat_train, nodes_sub, power = 1.0)
+    VW_MAPE_test = vega_weighted_mape(C_test.values[:-1], C_hat_test, nodes_sub, power = 1.0)
     PDA_train  = pda_from_pca(Z_train, PCA(n_components=min(cfg.dda, Z_train.shape[1])).fit(Z_train)) if cfg.decoder!=DecoderKind.HINGE_STATIC else pda_from_pca(Z_train, PCA(n_components=min(cfg.dda, Z_train.shape[1])).fit(Z_train))
     PSAS_train = psas(C_hat_train, A, b, tol=5e-3)
     PSAS_test  = psas(C_hat_test,  A, b, tol=5e-3)
