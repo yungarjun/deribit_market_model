@@ -9,16 +9,16 @@ class NeuralSDE(torchsde.SDEIto):
 
         # Drift
         self.f_net = nn.Sequential(
-            nn.Linear(dim, 128),
+            nn.Linear(dim, 256),
             nn.ReLU(),
-            nn.Linear(128, dim)
+            nn.Linear(256, dim)
         )
 
         # Diffusion network (output >= 0)
         self.g_net = nn.Sequential(
-            nn.Linear(dim, 128),
+            nn.Linear(dim, 256),
             nn.ReLU(),
-            nn.Linear(128, dim),
+            nn.Linear(256, dim),
             nn.Softplus()
         )
 

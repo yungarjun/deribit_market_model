@@ -30,11 +30,24 @@ def build_xi_training_data(out, use_dyn = True, use_sa = True, use_stat = True):
 
     return X_train, X_test, names
 
-
+# Build lattice training (for training on full lattice)
+def build_lattice_training_data(out):
+    """
+    Use the full liquid lattice as the state:
+      X_train = out.C_train.values  (T_train x K)
+      X_test  = out.C_test.values   (T_test  x K)
+    """
+    X_train = out.C_train.values.astype(np.float64)
+    X_test  = out.C_test.values.astype(np.float64)
+    names = [str(c) for c in out.C_train.columns]  # optional labels
+    return X_train, X_test, names
 
 # # Training loop with likelihood based loss
-def likelihood_training(out, n_epochs, batch_size, lr=1e-3):
-    X_train, X_test, names = build_xi_training_data(out)
+def likelihood_training(out, n_epochs, batch_size, lr=1e-3, data: str = "xi"):
+    if data == 'xi':
+        X_train, X_test, names = build_xi_training_data(out)
+    elif data == "lattice":
+        X_train, X_test, _ = build_lattice_training_data(out)
     
     # Training shapes
     n_train, dim = X_train.shape
@@ -61,7 +74,7 @@ def likelihood_training(out, n_epochs, batch_size, lr=1e-3):
     # dt_pairs_t = torch.from_numpy(dt_test_pairs).float().to(device)
 
     # dt between consecutive rows in years (torch tensors on device)
-    sec_per_year = 365.0 * 24 * 3600
+    sec_per_year = 1
     tt = out.C_train.index.values
     dt_train_pairs = (np.diff(tt).astype('timedelta64[s]').astype(np.float64) / sec_per_year)
     dt_train_pairs = dt_train_pairs[:max(0, n_train - 1)]
@@ -104,8 +117,8 @@ def likelihood_training(out, n_epochs, batch_size, lr=1e-3):
             # print(var)
 
             # Negative log likelihood per coordinate
-            # nll = 0.5 * ((dy - drift * dt) ** 2) / var + torch.log(2 * np.pi * var)
-            nll = ait_sahalia_quasi_nll(model, y0, y1, dt)
+            nll = 0.5 * ((dy - drift * dt) ** 2) / var + torch.log(2 * np.pi * var)
+            # nll = ait_sahalia_quasi_nll(model, y0, y1, dt)
 
             loss = nll.mean()
 
@@ -124,7 +137,7 @@ def likelihood_training(out, n_epochs, batch_size, lr=1e-3):
 
         # evaluate on test
         model.eval()
-        with torch.set_grad_enabled(True):
+        with torch.no_grad():
 
             y0_test = X_test[:-1]
             y1_test = X_test[1:]
@@ -133,8 +146,8 @@ def likelihood_training(out, n_epochs, batch_size, lr=1e-3):
             diff_t = model.g(0, y0_test)
             dy_t = y1_test - y0_test
             var_t = (diff_t ** 2) * dt + 1e-6
-            # nll_t = 0.5 * ((dy_t - drift_t * dt)**2 / var_t + torch.log(2 * np.pi * var_t))
-            nll_t = ait_sahalia_quasi_nll(model, y0_test, y1_test, dt)
+            nll_t = 0.5 * ((dy_t - drift_t * dt)**2 / var_t + torch.log(2 * np.pi * var_t))
+            # nll_t = ait_sahalia_quasi_nll(model, y0_test, y1_test, dt)
             test_loss = nll_t.mean().item()
             test_losses.append(test_loss)
 

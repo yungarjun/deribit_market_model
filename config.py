@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -6,6 +6,23 @@ class DecoderKind(str, Enum):
     HINGE_STATIC = "hinge_static" # Wang's greedy SA with hinge QP penalty
     PLS = "pls" # simple (linear) PLS with CV factor count
     DEEP_PLS = "deep_pls" # NN-based PLS surrogate (optional)
+
+
+@dataclass
+class MicrostructureCfg:
+    stale_max_s: float = 300.0           # drop quotes if last update > this (per instrument)
+    spread_max: float = 0.1            # (ask-bid)/mid <= spread_max
+    depth_q: float = 0.25               # require size >= τ-bucket quantile
+    tau_min_minutes: float = 30.0       # τ ≥ this
+    tau_max_days: float = 7.0           # τ ≤ this (set None to disable)
+    vega_min_pct: float = 0.1          # drop vega below this τ-bucket percentile (0..1)
+    mad_k: float = 5.0                  # |x - med| / MAD ≤ k in (τ_bin, m_bin)
+    n_tau_buckets: int = 8              # provisional bucketing for adaptive thresholds
+    n_m_buckets: int = 12
+    calendar_check: bool = True         # enforce c longer τ ≥ shorter τ at same m-bin
+    vertical_check: bool = True         # enforce monotone/convex in strike per τ row
+    debug: bool = True
+    
 
 
 @dataclass
@@ -48,3 +65,11 @@ class Algo1Config:
 
     # misc
     seed: int = 0
+
+    # microstructure filtering config
+    micro: MicrostructureCfg = field(default_factory=MicrostructureCfg)
+
+    price_scale: float = 1000 # multiply lattice prices by this to aid training
+
+
+
