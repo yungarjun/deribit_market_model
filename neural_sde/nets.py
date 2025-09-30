@@ -4,8 +4,9 @@ import torchsde
 import torch
 
 class NeuralSDE(torchsde.SDEIto):
-    def __init__(self, dim):
+    def __init__(self, dim, zero_drift: bool = False):
         super().__init__(noise_type = 'diagonal')
+        self.zero_drift = zero_drift
 
         # Drift
         self.f_net = nn.Sequential(
@@ -23,6 +24,8 @@ class NeuralSDE(torchsde.SDEIto):
         )
 
     def f(self, t, y):
+        if self.zero_drift:
+            return torch.zeros_like(y)
         return self.f_net(y)
     
     def g(self, t, y):

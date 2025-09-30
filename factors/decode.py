@@ -30,7 +30,7 @@ def decode_static_arb_hinge(R_sa_train: np.ndarray,         # residual after dyn
                             A: sp.csr_matrix, b: np.ndarray, # constraints
                             n_sa=2, n_PC=8,
                             lam_rec=1e-3,
-                            lam_hinge=10,
+                            lam_hinge=4,
                             maxfun=8000,
                             seed=0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """

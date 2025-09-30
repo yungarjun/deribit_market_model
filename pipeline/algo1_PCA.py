@@ -87,7 +87,7 @@ def _stage0_block(C_train, C_test, train_df, test_df, cfg: Algo1Config, spot_tra
     # spot_train = (train_df.drop_duplicates('timestamp').set_index('timestamp').loc[C_train.index, 'underlying_price'].values)
     # spot_test  = (test_df.drop_duplicates('timestamp'). set_index('timestamp').loc[C_test.index,  'underlying_price'].values)
 
-    sec_per_year = 365*24*3600
+    sec_per_year = 1
     tt_train = pd.to_datetime(C_train.index.values)
     tt_test  = pd.to_datetime(C_test.index.values)
     dt_train = (tt_train[1:] - tt_train[:-1]).total_seconds() / sec_per_year

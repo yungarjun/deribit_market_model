@@ -43,7 +43,7 @@ def build_lattice_training_data(out):
     return X_train, X_test, names
 
 # # Training loop with likelihood based loss
-def likelihood_training(out, n_epochs, batch_size, lr=1e-3, data: str = "xi"):
+def likelihood_training(out, n_epochs, batch_size, zero_drift: bool = False, lr=1e-3, data: str = "xi"):
     if data == 'xi':
         X_train, X_test, names = build_xi_training_data(out)
     elif data == "lattice":
@@ -56,7 +56,7 @@ def likelihood_training(out, n_epochs, batch_size, lr=1e-3, data: str = "xi"):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = NeuralSDE(dim).to(device)
+    model = NeuralSDE(dim, zero_drift=zero_drift).to(device)
 
     # Convert data to torch tensors on device
     X_train = torch.from_numpy(X_train).float().to(device)

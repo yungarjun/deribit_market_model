@@ -315,7 +315,7 @@ def constrained_scores_3d_strict(C, out, base_eps=1e-3, tol_check=0.0, max_backo
 
 
 # ---------- Plotting ----------
-def plot_threefactor_polyhedron_strict(out, use_test=False, base_eps=1e-3, tol_check=0.0,
+def plot_threefactor_polyhedron_strict(out, title,use_test=False, base_eps=1e-3, tol_check=0.0,
                                        zoom_factor=0.8):
     """
     Plot scores strictly inside the static no-arb polyhedron, solved without reprojection.
@@ -431,7 +431,7 @@ def constrained_scores_2d(C: np.ndarray, out, tol=5e-3):
     return xi, pts
 
 
-def plot_twofactor_polygon(out, use_test=False):
+def plot_twofactor_polygon(out, title = None, use_test=False):
     C = (out.C_test.values if use_test else out.C_train.values)
     xi, pts = constrained_scores_2d(C, out, tol=5e-3)   # same tol as PSAS
     fig, ax = plt.subplots(figsize=(6.6,3))
@@ -444,6 +444,9 @@ def plot_twofactor_polygon(out, use_test=False):
         cyc = np.vstack([poly, poly[0]])
         ax.plot(cyc[:,0], cyc[:,1], "r--", lw=2.0)
     ax.set_xlabel(r"$\xi_s$"); ax.set_ylabel(r"$\xi_a$")
-    ax.set_title("2-factor scores within static no-arb polygon")
+    if title is None:
+        ax.set_title("2-factor scores within static no-arb polygon")
+    else:
+        ax.set_title(title)
     return fig, ax
 
