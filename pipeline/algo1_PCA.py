@@ -159,7 +159,11 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date, r=
     common_tau_grid = np.unique(common_nodes[:,0])
     common_m_grid   = {τ: sorted(common_nodes[common_nodes[:,0]==τ,1])
                     for τ in common_tau_grid}
+    
+    # Ensure columns at zero maturity have zero factor loading 
+    tau0_mask = np.isclose(common_nodes[:, 0], 0.0, atol = 1e-12)
      
+    # Building static no arbitrage constraints
     ab = build_noarb_constraints(common_nodes, common_tau_grid, common_m_grid)
     A_raw, b_raw = ab.A, ab.b
 
@@ -167,8 +171,6 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date, r=
 
     # Reduction in linear constraints
     A, b, kept_mask = reduce_constraints_geq(A_raw, b_raw, tol = 1e-9, solver = "OSQP")
-
-   
 
     # If lattice values will be scaled, scale RHS of constraints to stay consistent
     if getattr(cfg, "price_scale", 1.0) != 1.0:
@@ -181,7 +183,7 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date, r=
         C_train.loc[:, :] = C_train.values * cfg.price_scale
         C_test.loc[:, :] = C_test.values * cfg.price_scale
         
-
+    # Arbitrage repair 
     C_train = projection_fast_cvxpy(Ci_train, common_nodes, common_tau_grid, common_m_grid, A  = A, b = b)
     C_test  = projection_fast_cvxpy(Ci_test,  common_nodes, common_tau_grid, common_m_grid, A = A, b = b)
 
@@ -239,6 +241,12 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date, r=
     # Running PCA 
     pca_dyn = PCA(n_components = cfg.dda, random_state=cfg.seed).fit(Z_train)
     G_dyn = pca_dyn.components_
+    
+    # Enforce zero loadings at tau = 0
+    if G_dyn.size >0:
+         G_dyn[:, tau0_mask] == 0.0
+    
+
     # For dynamic arb PCA
     # var_dyn = pca_dyn.explained_variance_ratio_.sum()
     # first_dyn = pca_dyn.explained_variance_ratio_[0]
@@ -266,6 +274,9 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date, r=
     G_stat = pca_stat.components_
     Xi_stat_train = pca_stat.transform(R_dda_train)
     Xi_stat_test  = pca_stat.transform(R_dda_test)
+    # Enforce zero loadings at tau=0 for statistical factors
+    if G_stat.size > 0:
+         G_stat[:, tau0_mask] = 0.0
 
     # For statistical PCA
     var_stat = pca_stat.explained_variance_ratio_.sum()
@@ -276,6 +287,7 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date, r=
     # Xi_stat_train = R_dda_train @ G_stat.T
     # Xi_stat_test = (R0_prices_test - Xi_dyn_test @ G_dyn) @ G_stat.T
 
+   # ----- Static Arbitrage Factors on leftover residual ------
     Recon_sofar_train = Xi_dyn_train @ G_dyn + Xi_stat_train @ G_stat
     R_sa_train = R0_prices_train - Recon_sofar_train
     G_sa, Xi_sa_train, _W = decode_static_arb_hinge(
@@ -284,6 +296,12 @@ def run_algo1_deribit(df_raw: pd.DataFrame, cfg: Algo1Config, reference_date, r=
         A=A, b=b, n_sa=cfg.n_sa, n_PC=cfg.n_PC_sa,
         lam_rec=cfg.lam_rec, lam_hinge=cfg.lam_hinge, maxfun=8000, seed=cfg.seed
     )
+    # Enforce zero loading at tau=0 for static arb factors and recompute scores
+    if cfg.n_sa > 0 and G_sa.size >0:
+         G_sa[:, tau0_mask] = 0.0
+         # recompute train scores with constrained loading
+         Xi_sa_train = R_sa_train @ np.linalg.pinv(G_sa)
+
     # Xi_sa_test = (R0_prices_test - (Xi_dyn_test @ G_dyn + Xi_stat_test @ G_stat)) @ np.linalg.pinv(G_sa)
     Recon_sofar_test = Xi_dyn_test @ G_dyn + Xi_stat_test @ G_stat
     Xi_sa_test = (R0_prices_test - Recon_sofar_test) @ np.linalg.pinv(G_sa)
