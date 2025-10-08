@@ -3,6 +3,7 @@ import torch.optim as optim
 import torchsde
 import torch
 from neural_sde.nets import NeuralSDE, NeuralSDEWithShrink
+from neural_sde.constraints import _apply_boundary_correction, calc_drift_correction, calc_diffusion_scaling, build_factor_path, assemble_Wb_for_shrinkage, compute_factor_polytope_vertices
 import numpy as np
 import math
 
@@ -79,6 +80,17 @@ def likelihood_training(out, Omega_tr, det_Omega_tr, proj_dX_tr,
     det_Omega_te  = torch.from_numpy(det_Omega_te).float().to(device).view(-1, 1)
     proj_dX_te    = torch.from_numpy(proj_dX_te).float().to(device)
 
+    # Drift Scaling
+    poly = compute_factor_polytope_vertices(
+    out,
+    xi_builder=None,      # or None if Xi_*_train are on outs
+    k_box=6.0,
+    verbose=False,
+    return_mappings=True,
+)
+    W, b = assemble_Wb_for_shrinkage(poly, include_box=True)
+    X_interior, corr_dirs, epsmu = calc_drift_correction(W, b, X  = build_factor_path(out, xi_builder=None), epsmu_star = 10, rho_star = 1e-5)
+
     # dt between consecutive rows in years (torch tensors on device)
     sec_per_year = 1
     tt = out.C_train.index.values
@@ -130,7 +142,9 @@ def likelihood_training(out, Omega_tr, det_Omega_tr, proj_dX_tr,
             # Negative log likelihood per coordinate
             # nll = 0.5 * ((dy - drift * dt) ** 2) / var + torch.log(2 * np.pi * var)
             # nll = ait_sahalia_quasi_nll(model, y0, y1, dt)
-            nll = shrunk_gaussian_nll(y0, y1, dt, Omega_b, det_Omega_b, proj_dX_b, model = model, diagonal_diffusion=True)
+            nll = shrunk_gaussian_nll(y0, y1, dt, Omega_b, det_Omega_b, proj_dX_b,
+                                       model = model, diagonal_diffusion=True,
+                                       t_idx = idx, corr_dirs=corr_dirs, epsmu=epsmu)
 
             loss = nll.mean()
 
@@ -143,9 +157,22 @@ def likelihood_training(out, Omega_tr, det_Omega_tr, proj_dX_tr,
 
             epoch_loss += loss.mean().item() * y0.size(0)
         
-        train_loss = epoch_loss / (n_train - 1)
+        # train_loss = epoch_loss / (n_train - 1)
 
-        train_losses.append(train_loss)
+        # train_losses.append(train_loss)
+        # Recompute full-train loss with the final params (comparable to test)
+        model.eval()
+        with torch.no_grad():
+            y0_tr_full = X_train[:-1]
+            y1_tr_full = X_train[1:]
+            dt_tr_full = dt_train_t
+            nll_tr_full = shrunk_gaussian_nll(
+                y0_tr_full, y1_tr_full, dt_tr_full,
+                Omega_tr, det_Omega_tr, proj_dX_tr,
+                model=model, diagonal_diffusion=True
+            )
+            train_loss = nll_tr_full.mean().item()
+            train_losses.append(train_loss)
 
         # evaluate on test
         model.eval()
@@ -215,22 +242,94 @@ def ait_sahalia_quasi_nll(model, y0, y1, dt, eps_dt=1e-10, eps_sig=1e-10):
         return nll  # (B,d)
 
 
+# def shrunk_gaussian_nll(
+#     y0, y1, dt,
+#     Omega, det_Omega, proj_dX,           # from calc_diffusion_scaling (aligned per step)
+#     model,
+#     diagonal_diffusion: bool = True,
+#     eps: float = 1e-12,
+# ):
+#     """
+#     y0,y1: [B,p]
+#     dt:    [B] or [B,1]
+#     Omega: [B,p,p]
+#     det_Omega: [B,1]   (positive)
+#     proj_dX:   [B,p]   (this is Ω^{-T} dX; if you don't have it, compute it with Omega)
+#     model.f/.g at (t=0, y0) returning drift [B,p] and diffusion:
+#         - if diagonal_diffusion: diff diag entries [B,p]  (>=0 via Softplus)
+#         - else: lower-tri Cholesky L of Σ (B,p,p) with positive diag
+#     """
+#     B, p = y0.shape
+#     dt = dt.view(-1)  # [B]
+
+#     # Increments and model evals
+#     dy    = y1 - y0                      # [B,p]
+#     mu    = model.f(0.0, y0)             # [B,p]
+#     g_out = model.g(0.0, y0)
+
+#     # Project drift with Ω^{-T} (proj_dX is already Ω^{-T} dX)
+#     # proj_mu = Ω^{-T} μ
+#     proj_mu = torch.linalg.solve(Omega.transpose(-1, -2), mu.unsqueeze(-1)).squeeze(-1)  # [B,p]
+
+#     # l1: log-determinant pieces
+#     #   2 * sum(log det Ω) + 2 * sum(log diag(L))  (per-sample)
+#     log_det_Omega = torch.log(det_Omega.clamp_min(eps)).squeeze(-1)  # [B]
+
+#     if diagonal_diffusion:
+#         # Σ = diag(diff^2) -> Cholesky L = diag(diff)
+#         diff    = g_out.clamp_min(eps)                 # [B,p], assume Softplus already
+#         logdetΣ = 2.0 * torch.sum(torch.log(diff), dim=-1)  # [B]
+#         # Whiten: L^{-1} v  is just v / diff
+#         sol_dX  = proj_dX / diff                       # [B,p]
+#         sol_mu  = proj_mu / diff                       # [B,p]
+#     else:
+#         # g_out is lower-triangular Cholesky L of Σ (B,p,p)
+#         L = g_out
+#         logdetΣ = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)  # [B]
+#         # Whiten by solving L z = v  (lower=True)
+#         sol_dX = torch.linalg.solve_triangular(L, proj_dX.unsqueeze(-1), upper=False).squeeze(-1)  # [B,p]
+#         sol_mu = torch.linalg.solve_triangular(L, proj_mu.unsqueeze(-1), upper=False).squeeze(-1)  # [B,p]
+
+#     l1 = 2.0 * log_det_Omega + 2.0 * logdetΣ                         # [B]
+
+#     # Quadratic parts (Euler–Gaussian form with shrinkage):
+#     # l2 = (1/dt) * || L^{-1} Ω^{-T} dX ||^2
+#     # l3 =  dt     * || L^{-1} Ω^{-T} μ  ||^2
+#     # l4 = -2      * < L^{-1} Ω^{-T} μ , L^{-1} Ω^{-T} dX >
+#     quad1 = (sol_dX.pow(2).sum(dim=-1)) / dt                         # [B]
+#     quad2 = (sol_mu.pow(2).sum(dim=-1)) * dt                         # [B]
+#     quad3 = -2.0 * (sol_mu * sol_dX).sum(dim=-1)                     # [B]
+
+#     nll_per_step = l1 + quad1 + quad2 + quad3                        # [B]
+#     # (Optional) add + p*log(dt) and + p*log(2π) constants; they don't affect training.
+#     return nll_per_step
+
+
+# Shrunk gaussian for drift and diffusion
 def shrunk_gaussian_nll(
     y0, y1, dt,
     Omega, det_Omega, proj_dX,           # from calc_diffusion_scaling (aligned per step)
     model,
     diagonal_diffusion: bool = True,
     eps: float = 1e-12,
+    # ------- BC (boundary correction) additions -------
+    t_idx: torch.Tensor | None = None,   # [B] time indices mapping each row of y0 to global time
+    corr_dirs=None,                      # [T,K,p] or [T, K*p]
+    epsmu=None,                          # [T,K]
+    bc_lambda: float = 1.0,              # correction strength
+    bc_eps_floor: float = 1e-8,
+    bc_cap: float | None = None,
+    bc_epsmu_cutoff: float | None = None,
 ):
     """
     y0,y1: [B,p]
     dt:    [B] or [B,1]
     Omega: [B,p,p]
     det_Omega: [B,1]   (positive)
-    proj_dX:   [B,p]   (this is Ω^{-T} dX; if you don't have it, compute it with Omega)
-    model.f/.g at (t=0, y0) returning drift [B,p] and diffusion:
-        - if diagonal_diffusion: diff diag entries [B,p]  (>=0 via Softplus)
-        - else: lower-tri Cholesky L of Σ (B,p,p) with positive diag
+    proj_dX:   [B,p]   (this is Ω^{-T} dX)
+    model.f/.g at (t=0, y0) returning drift [B,p] and diffusion.
+
+    If corr_dirs/epsmu/t_idx are provided, μ is corrected near the static-arb boundary.
     """
     B, p = y0.shape
     dt = dt.view(-1)  # [B]
@@ -238,41 +337,41 @@ def shrunk_gaussian_nll(
     # Increments and model evals
     dy    = y1 - y0                      # [B,p]
     mu    = model.f(0.0, y0)             # [B,p]
+
+    # ----- apply boundary correction to μ if provided -----
+    if (corr_dirs is not None) and (epsmu is not None) and (t_idx is not None):
+        mu = _apply_boundary_correction(
+            mu, t_idx, corr_dirs, epsmu,
+            bc_lambda=bc_lambda, bc_eps_floor=bc_eps_floor,
+            bc_cap=bc_cap, bc_epsmu_cutoff=bc_epsmu_cutoff,
+            device=y0.device,
+        )
+
     g_out = model.g(0.0, y0)
 
     # Project drift with Ω^{-T} (proj_dX is already Ω^{-T} dX)
-    # proj_mu = Ω^{-T} μ
     proj_mu = torch.linalg.solve(Omega.transpose(-1, -2), mu.unsqueeze(-1)).squeeze(-1)  # [B,p]
 
     # l1: log-determinant pieces
-    #   2 * sum(log det Ω) + 2 * sum(log diag(L))  (per-sample)
     log_det_Omega = torch.log(det_Omega.clamp_min(eps)).squeeze(-1)  # [B]
 
     if diagonal_diffusion:
-        # Σ = diag(diff^2) -> Cholesky L = diag(diff)
-        diff    = g_out.clamp_min(eps)                 # [B,p], assume Softplus already
-        logdetΣ = 2.0 * torch.sum(torch.log(diff), dim=-1)  # [B]
-        # Whiten: L^{-1} v  is just v / diff
-        sol_dX  = proj_dX / diff                       # [B,p]
-        sol_mu  = proj_mu / diff                       # [B,p]
+        diff    = g_out.clamp_min(eps)                 # [B,p]
+        logdetΣ = 2.0 * torch.sum(torch.log(diff), dim=-1)     # [B]
+        sol_dX  = proj_dX / diff                               # [B,p]
+        sol_mu  = proj_mu / diff                               # [B,p]
     else:
-        # g_out is lower-triangular Cholesky L of Σ (B,p,p)
         L = g_out
         logdetΣ = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)  # [B]
-        # Whiten by solving L z = v  (lower=True)
-        sol_dX = torch.linalg.solve_triangular(L, proj_dX.unsqueeze(-1), upper=False).squeeze(-1)  # [B,p]
-        sol_mu = torch.linalg.solve_triangular(L, proj_mu.unsqueeze(-1), upper=False).squeeze(-1)  # [B,p]
+        sol_dX  = torch.linalg.solve_triangular(L, proj_dX.unsqueeze(-1), upper=False).squeeze(-1)  # [B,p]
+        sol_mu  = torch.linalg.solve_triangular(L, proj_mu.unsqueeze(-1), upper=False).squeeze(-1)  # [B,p]
 
-    l1 = 2.0 * log_det_Omega + 2.0 * logdetΣ                         # [B]
+    l1 = 2.0 * log_det_Omega + 2.0 * logdetΣ
 
-    # Quadratic parts (Euler–Gaussian form with shrinkage):
-    # l2 = (1/dt) * || L^{-1} Ω^{-T} dX ||^2
-    # l3 =  dt     * || L^{-1} Ω^{-T} μ  ||^2
-    # l4 = -2      * < L^{-1} Ω^{-T} μ , L^{-1} Ω^{-T} dX >
-    quad1 = (sol_dX.pow(2).sum(dim=-1)) / dt                         # [B]
-    quad2 = (sol_mu.pow(2).sum(dim=-1)) * dt                         # [B]
-    quad3 = -2.0 * (sol_mu * sol_dX).sum(dim=-1)                     # [B]
+    # Quadratic parts (Euler–Gaussian with shrinkage):
+    quad1 = (sol_dX.pow(2).sum(dim=-1)) / dt
+    quad2 = (sol_mu.pow(2).sum(dim=-1)) * dt
+    quad3 = -2.0 * (sol_mu * sol_dX).sum(dim=-1)
 
-    nll_per_step = l1 + quad1 + quad2 + quad3                        # [B]
-    # (Optional) add + p*log(dt) and + p*log(2π) constants; they don't affect training.
+    nll_per_step = l1 + quad1 + quad2 + quad3
     return nll_per_step
