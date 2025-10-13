@@ -46,6 +46,45 @@ def build_lattice_grid(df: pd.DataFrame, n_tau=5, n_m=5, random_state=0) -> Latt
     nn = NearestNeighbors(n_neighbors=1).fit(nodes)
     return Lattice(nn=nn, nodes=nodes, tau_grid=tau_grid, m_grid=m_grid)
 
+
+# def build_lattice_grid(df: pd.DataFrame, n_tau=5, n_m=5, random_state=0) -> Lattice:
+#     """
+#     Build a τ-grid with KMeans on unique τ (sorted), then per-τ robust m-grids.
+#     Returns nodes and a 1-NN snapper.
+#     """
+#     work = df.copy()
+#     taus_unique = np.sort(work['tau'].astype(float).unique()).reshape(-1, 1)
+#     if taus_unique.size == 0:
+#         raise ValueError("No tau values found.")
+
+#     if taus_unique.shape[0] <= n_tau:
+#         # Not enough unique taus: just use sorted uniques
+#         tau_grid = taus_unique.ravel().astype(float)
+#         # assign each row to nearest τ in tau_grid
+#         idx = np.searchsorted(tau_grid, work['tau'].to_numpy(), side='left')
+#         idx = np.clip(idx, 0, len(tau_grid)-1)
+#         work['tau_cluster'] = idx
+#     else:
+#         km = KMeans(n_clusters=n_tau, random_state=random_state, n_init=5).fit(taus_unique)
+#         centers = km.cluster_centers_.ravel()             # (n_tau,)
+#         order = np.argsort(centers)                       # (n_tau,)
+#         tau_grid = centers[order]                         # sorted centers
+#         raw_lab = km.predict(work[['tau']].to_numpy())    # ints in [0..n_tau-1]
+#         old2new = {int(old): int(new) for new, old in enumerate(order)}
+#         work['tau_cluster'] = np.vectorize(old2new.get)(raw_lab)
+
+#     # per-τ m-grids (robust 1–99 percentiles)
+#     m_grid: Dict[float, np.ndarray] = {}
+#     for i, τ in enumerate(tau_grid):
+#         sub = work[work['tau_cluster'] == i]
+#         lo, hi = np.percentile(work['m'], [1, 99]) if len(sub) == 0 else np.percentile(sub['m'], [1, 99])
+#         m_grid[float(τ)] = np.linspace(float(lo), float(hi), int(n_m))
+
+#     # nodes and NN
+#     nodes = np.vstack([[float(τ), float(m)] for τ in tau_grid for m in m_grid[float(τ)]])
+#     nn = NearestNeighbors(n_neighbors=1).fit(nodes)
+#     return Lattice(nn=nn, nodes=nodes, tau_grid=np.asarray(tau_grid, float), m_grid=m_grid)
+
 # def build_lattice_grid(df, n_tau=20, n_m=5, top_K=50):
 #     """
 #     Learn a *sorted* τ-grid and consistent labels, then build m-grids, nodes, and a 1-NN snapper.

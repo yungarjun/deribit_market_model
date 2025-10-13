@@ -319,7 +319,7 @@ def shrunk_gaussian_nll(
     bc_lambda: float = 1.0,              # correction strength
     bc_eps_floor: float = 1e-8,
     bc_cap: float | None = None,
-    bc_epsmu_cutoff: float | None = None,
+    bc_epsmu_cutoff: float = 1e-3,       # Disable correction at a certain point inside
 ):
     """
     y0,y1: [B,p]
@@ -375,3 +375,228 @@ def shrunk_gaussian_nll(
 
     nll_per_step = l1 + quad1 + quad2 + quad3
     return nll_per_step
+
+
+
+def _build_omega_proj_from_state(y0: torch.Tensor,
+                                 y1: torch.Tensor,
+                                 H: torch.Tensor, h: torch.Tensor,
+                                 dist_multiplier: float, proj_scale: float,
+                                 eps_floor: float = 1e-12):
+    """
+    Compute Ω(y0), |det Ω(y0)|, and proj_dX = Ω(y0)^{-T} (y1-y0) for each sample.
+    Matches the external construction: pick p faces with smallest ε_t and set Ω = diag(√ε) @ V,
+    where V = qr(H_sel^T).Q^T and ε = proj_scale * (k*rho)/(1 + k*rho).
+    Shapes:
+      y0,y1: (B,p)
+      H: (R,p), h: (R,)
+    Returns:
+      Omega:     (B,p,p)
+      det_Omega: (B,1)
+      proj_dX:   (B,p)
+    """
+    device = y0.device
+    B, p = y0.shape
+    R = H.shape[0]
+    assert H.shape[1] == p
+
+    # distances ρ_t to faces (rows of H are already unit-norm from assemble_Wb_for_shrinkage)
+    # ρ = |H y - h|
+    rho = torch.abs(H @ y0.T - h.view(-1, 1)).T  # (B, R)
+
+    # ε(ρ) = proj_scale * (k ρ)/(1 + k ρ)
+    k = float(dist_multiplier)
+    eps_all = proj_scale * (k * rho) / (1.0 + k * rho)               # (B, R)
+
+    Omega_list = []
+    det_list = []
+    proj_dX_list = []
+
+    dy = (y1 - y0)                                                  # (B,p)
+    I = torch.eye(p, device=device)
+
+    for b in range(B):
+        # choose p faces with smallest ε
+        eps_b = eps_all[b]                                          # (R,)
+        idx = torch.topk(eps_b, k=p, largest=False).indices         # (p,)
+        eps_sel = torch.clamp(eps_b.index_select(0, idx), min=eps_floor)  # (p,)
+
+        H_sel = H.index_select(0, idx)                              # (p,p)
+        # V = qr(H_sel^T).Q^T
+        Q = torch.linalg.qr(H_sel.T, mode="reduced").Q              # (p,p)
+        V = Q.transpose(0, 1)                                       # (p,p)
+
+        Dsqrt = torch.sqrt(eps_sel).diag()                          # (p,p)
+        Omega_b = Dsqrt @ V                                         # (p,p)
+        # det may be negative via V; use absolute value (external uses abs)
+        det_b = torch.det(Omega_b).abs().view(1, 1)                 # (1,1)
+
+        # proj_dX = Ω^{-T} dX = (Ω^T)^{-1} dX
+        proj_b = torch.linalg.solve(Omega_b.T, dy[b])               # (p,)
+
+        Omega_list.append(Omega_b)
+        det_list.append(det_b)
+        proj_dX_list.append(proj_b)
+
+    Omega = torch.stack(Omega_list, dim=0)                          # (B,p,p)
+    det_Omega = torch.cat(det_list, dim=0)                          # (B,1)
+    proj_dX = torch.stack(proj_dX_list, dim=0)                      # (B,p)
+    return Omega, det_Omega, proj_dX
+
+
+def shrunk_gaussian_nll_endogenous(
+    y0, y1, dt,
+    H, h,                        # faces (row-normalized) for shrink
+    dist_multiplier: float, proj_scale: float,
+    model,
+    diagonal_diffusion: bool = True,
+    eps: float = 1e-12,
+    # ------- BC (boundary correction) additions -------
+    t_idx: torch.Tensor | None = None,   # [B]
+    corr_dirs=None,                      # [T,K,p] or [T,K*p]
+    epsmu=None,                          # [T,K]
+    bc_lambda: float = 1.0,
+    bc_eps_floor: float = 1e-8,
+    bc_cap: float | None = None,
+    bc_epsmu_cutoff: float = 1e-3,
+):
+    """
+    Same kernel as shrunk_gaussian_nll, but computes Ω(y0), |detΩ(y0)| and Ω^{-T} dX in-graph.
+    """
+    B, p = y0.shape
+    dt = dt.view(-1)
+
+    # base drift at y0
+    mu = model.f(0.0, y0)          # [B,p]
+
+    # optional boundary correction to drift
+    if (corr_dirs is not None) and (epsmu is not None) and (t_idx is not None):
+        mu = _apply_boundary_correction(
+            mu, t_idx, corr_dirs, epsmu,
+            bc_lambda=bc_lambda, bc_eps_floor=bc_eps_floor,
+            bc_cap=bc_cap, bc_epsmu_cutoff=bc_epsmu_cutoff, device=y0.device
+        )
+
+    # build Ω(y0), detΩ(y0), and Ω^{-T} dX
+    Omega, det_Omega, proj_dX = _build_omega_proj_from_state(
+        y0, y1, H, h, dist_multiplier=dist_multiplier, proj_scale=proj_scale
+    )
+
+    # project μ: proj_mu = Ω^{-T} μ
+    proj_mu = torch.linalg.solve(Omega.transpose(1, 2), mu.unsqueeze(-1)).squeeze(-1)  # [B,p]
+
+    g_out = model.g(0.0, y0)
+
+    log_det_Omega = torch.log(det_Omega.clamp_min(eps)).squeeze(-1)  # [B]
+    if diagonal_diffusion:
+        diff    = g_out.clamp_min(eps)                                # [B,p]
+        logdetΣ = 2.0 * torch.sum(torch.log(diff), dim=-1)            # [B]
+        sol_dX  = proj_dX / diff                                      # [B,p]
+        sol_mu  = proj_mu / diff                                      # [B,p]
+    else:
+        L = g_out                                                     # [B,p,p] lower-tri
+        logdetΣ = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)
+        sol_dX  = torch.linalg.solve_triangular(L, proj_dX.unsqueeze(-1), upper=False).squeeze(-1)
+        sol_mu  = torch.linalg.solve_triangular(L, proj_mu.unsqueeze(-1), upper=False).squeeze(-1)
+
+    l1 = 2.0 * log_det_Omega + 2.0 * logdetΣ
+    quad1 = (sol_dX.pow(2).sum(dim=-1)) / dt
+    quad2 = (sol_mu.pow(2).sum(dim=-1)) * dt
+    quad3 = -2.0 * (sol_mu * sol_dX).sum(dim=-1)
+    return l1 + quad1 + quad2 + quad3
+
+# ...existing code...
+
+def likelihood_training_endogenous(out,
+                                   n_epochs, batch_size, lr=1e-3,
+                                   zero_drift: bool = False,
+                                   data: str = "xi",
+                                   model=None,
+                                   dist_multiplier: float = 1.0,
+                                   proj_scale: float = 0.9):
+    """
+    Like likelihood_training but computes Ω(y0) inside the loss.
+    Calibrate dist_multiplier exactly as you do before (critical hit).
+    """
+    if data == 'xi':
+        X_train, X_test, _ = build_xi_training_data(out)
+    elif data == "lattice":
+        X_train, X_test, _ = build_lattice_training_data(out)
+
+    n_train, dim = X_train.shape
+    n_test, _ = X_test.shape
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = (NeuralSDE(dim, zero_drift=zero_drift) if model is None else model).to(device)
+
+    # tensors
+    X_train = torch.from_numpy(X_train).float().to(device)
+    X_test  = torch.from_numpy(X_test).float().to(device)
+
+    # dt (keep same units used across the repo: seconds as "years" here)
+    sec_per_year = 1
+    tt_tr = out.C_train.index.values; tt_te = out.C_test.index.values
+    dt_tr = (np.diff(tt_tr).astype('timedelta64[s]').astype(np.float64) / sec_per_year)
+    dt_te = (np.diff(tt_te).astype('timedelta64[s]').astype(np.float64) / sec_per_year)
+    dt_tr_t = torch.from_numpy(dt_tr[:max(0, n_train-1)].copy()).float().to(device).unsqueeze(1)
+    dt_te_t = torch.from_numpy(dt_te[:max(0, n_test-1)].copy()).float().to(device).unsqueeze(1)
+
+    # shrink geometry: faces for Ω
+    poly = compute_factor_polytope_vertices(out, xi_builder=None, k_box=6.0, verbose=False, return_mappings=True)
+    H_np, h_np = poly["H"], poly["h"]
+    H_t = torch.from_numpy(H_np).float().to(device)
+    h_t = torch.from_numpy(h_np).float().to(device)
+
+    # drift BC geometry (optional; same as your existing trainer)
+    W, b = assemble_Wb_for_shrinkage(poly, include_box=True)
+    X_interior, corr_dirs_flat, epsmu = calc_drift_correction(W, b, X=build_factor_path(out, xi_builder=None),
+                                                              epsmu_star=10.0, rho_star=1e-5)
+    m_faces = W.shape[0]; p = dim
+    corr_dirs = corr_dirs_flat.reshape(-1, m_faces, p) if corr_dirs_flat.ndim == 2 and corr_dirs_flat.shape[1] == m_faces*p else corr_dirs_flat
+    corr_dirs_t = torch.from_numpy(corr_dirs).float().to(device) if corr_dirs is not None else None
+    epsmu_t     = torch.from_numpy(epsmu).float().to(device) if epsmu is not None else None
+
+    opt = optim.Adam(model.parameters(), lr=lr)
+    train_losses, test_losses = [], []
+
+    for epoch in range(n_epochs):
+        model.train()
+        epoch_loss = 0.0
+        for idx in torch.randperm(n_train - 1, device=device).split(batch_size):
+            y0 = X_train.index_select(0, idx)
+            y1 = X_train.index_select(0, idx + 1)
+            dtb = dt_tr_t.index_select(0, idx).view(-1, 1)
+
+            nll = shrunk_gaussian_nll_endogenous(
+                y0, y1, dtb,
+                H=H_t, h=h_t,
+                dist_multiplier=dist_multiplier, proj_scale=proj_scale,
+                model=model, diagonal_diffusion=True,
+                t_idx=idx, corr_dirs=corr_dirs_t, epsmu=epsmu_t,
+            )
+            loss = nll.mean()
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            opt.step()
+            epoch_loss += loss.item() * y0.size(0)
+
+        # full-train/test eval for curves comparable to existing trainer
+        model.eval()
+        with torch.no_grad():
+            y0_tr, y1_tr = X_train[:-1], X_train[1:]
+            nll_tr = shrunk_gaussian_nll_endogenous(
+                y0_tr, y1_tr, dt_tr_t,
+                H=H_t, h=h_t, dist_multiplier=dist_multiplier, proj_scale=proj_scale,
+                model=model, diagonal_diffusion=True,
+                t_idx=torch.arange(y0_tr.size(0), device=device), corr_dirs=corr_dirs_t, epsmu=epsmu_t
+            ).mean().item()
+            y0_te, y1_te = X_test[:-1], X_test[1:]
+            nll_te = shrunk_gaussian_nll_endogenous(
+                y0_te, y1_te, dt_te_t,
+                H=H_t, h=h_t, dist_multiplier=dist_multiplier, proj_scale=proj_scale,
+                model=model, diagonal_diffusion=True
+            ).mean().item()
+        train_losses.append(nll_tr); test_losses.append(nll_te)
+        print(f"Epoch {epoch+1}/{n_epochs}  Train NLL: {nll_tr:.4e}  Test NLL: {nll_te:.4e}")
+
+    return train_losses, test_losses, model, X_train
