@@ -89,7 +89,24 @@ def likelihood_training(out, Omega_tr, det_Omega_tr, proj_dX_tr,
     return_mappings=True,
 )
     W, b = assemble_Wb_for_shrinkage(poly, include_box=True)
-    X_interior, corr_dirs, epsmu = calc_drift_correction(W, b, X  = build_factor_path(out, xi_builder=None), epsmu_star = 10, rho_star = 1e-5)
+
+    # Build drift correction geometry
+    # X_interior, corr_dirs, epsmu = calc_drift_correction(W, b, X  = build_factor_path(out, xi_builder=None), epsmu_star = 10, rho_star = 1e-5)
+    X_tr_np = X_train.detach().cpu().numpy()
+    X_te_np = X_test.detach().cpu().numpy()
+    _, corr_dirs_tr, epsmu_tr = calc_drift_correction(W, b, X=X_tr_np, epsmu_star=10.0, rho_star=1e-5)
+    _, corr_dirs_te, epsmu_te = calc_drift_correction(W, b, X=X_te_np, epsmu_star=10.0, rho_star=1e-5)
+    
+    # reshape and move to device (match endogenous trainer)
+    m_faces = W.shape[0]
+    def to_torch_dirs(cdirs_np, dim):
+        if cdirs_np.ndim == 2 and cdirs_np.shape[1] == m_faces * dim:
+            cdirs_np = cdirs_np.reshape(-1, m_faces, dim)
+        return torch.from_numpy(cdirs_np).float().to(device)
+    corr_dirs_tr_t = to_torch_dirs(corr_dirs_tr, dim)
+    corr_dirs_te_t = to_torch_dirs(corr_dirs_te, dim)
+    epsmu_tr_t     = torch.from_numpy(epsmu_tr).float().to(device)
+    epsmu_te_t     = torch.from_numpy(epsmu_te).float().to(device)
 
     # dt between consecutive rows in years (torch tensors on device)
     sec_per_year = 1
@@ -144,7 +161,7 @@ def likelihood_training(out, Omega_tr, det_Omega_tr, proj_dX_tr,
             # nll = ait_sahalia_quasi_nll(model, y0, y1, dt)
             nll = shrunk_gaussian_nll(y0, y1, dt, Omega_b, det_Omega_b, proj_dX_b,
                                        model = model, diagonal_diffusion=True,
-                                       t_idx = idx, corr_dirs=corr_dirs, epsmu=epsmu)
+                                       t_idx = idx, corr_dirs=corr_dirs_tr_t, epsmu=epsmu_tr_t, bc_cap = 5.0)
 
             loss = nll.mean()
 
@@ -166,10 +183,18 @@ def likelihood_training(out, Omega_tr, det_Omega_tr, proj_dX_tr,
             y0_tr_full = X_train[:-1]
             y1_tr_full = X_train[1:]
             dt_tr_full = dt_train_t
+            # nll_tr_full = shrunk_gaussian_nll(
+            #     y0_tr_full, y1_tr_full, dt_tr_full,
+            #     Omega_tr, det_Omega_tr, proj_dX_tr,
+            #     model=model, diagonal_diffusion=True
+            # )
             nll_tr_full = shrunk_gaussian_nll(
                 y0_tr_full, y1_tr_full, dt_tr_full,
                 Omega_tr, det_Omega_tr, proj_dX_tr,
-                model=model, diagonal_diffusion=True
+                model=model, diagonal_diffusion=True,
+                t_idx=torch.arange(y0_tr_full.size(0), device=device),
+                corr_dirs=corr_dirs_tr_t, epsmu=epsmu_tr_t,
+                bc_cap=5.0
             )
             train_loss = nll_tr_full.mean().item()
             train_losses.append(train_loss)
@@ -187,7 +212,14 @@ def likelihood_training(out, Omega_tr, det_Omega_tr, proj_dX_tr,
             var_t = (diff_t ** 2) * dt + 1e-6
 
             # nll_t = 0.5 * ((dy_t - drift_t * dt)**2 / var_t + torch.log(2 * np.pi * var_t))
-            nll_t = shrunk_gaussian_nll(y0_test, y1_test, dt, Omega_te, det_Omega_te, proj_dX=proj_dX_te ,model=model, diagonal_diffusion=True)
+            # nll_t = shrunk_gaussian_nll(y0_test, y1_test, dt, Omega_te, det_Omega_te, proj_dX=proj_dX_te ,model=model, diagonal_diffusion=True)
+            nll_t = shrunk_gaussian_nll(
+                y0_test, y1_test, dt_test_t, Omega_te, det_Omega_te, proj_dX=proj_dX_te,
+                model=model, diagonal_diffusion=True,
+                t_idx=torch.arange(y0_test.size(0), device=device),
+                corr_dirs=corr_dirs_te_t, epsmu=epsmu_te_t,
+                bc_cap=5.0
+            )
             # nll_t = ait_sahalia_quasi_nll(model, y0_test, y1_test, dt)
             test_loss = nll_t.mean().item()
             test_losses.append(test_loss)
@@ -505,7 +537,7 @@ def shrunk_gaussian_nll_endogenous(
     quad3 = -2.0 * (sol_mu * sol_dX).sum(dim=-1)
     return l1 + quad1 + quad2 + quad3
 
-# ...existing code...
+
 
 def likelihood_training_endogenous(out,
                                    n_epochs, batch_size, lr=1e-3,
@@ -516,7 +548,7 @@ def likelihood_training_endogenous(out,
                                    proj_scale: float = 0.9):
     """
     Like likelihood_training but computes Ω(y0) inside the loss.
-    Calibrate dist_multiplier exactly as you do before (critical hit).
+    Calibrate dist_multiplier exactly as before.
     """
     if data == 'xi':
         X_train, X_test, _ = build_xi_training_data(out)
@@ -600,3 +632,4 @@ def likelihood_training_endogenous(out,
         print(f"Epoch {epoch+1}/{n_epochs}  Train NLL: {nll_tr:.4e}  Test NLL: {nll_te:.4e}")
 
     return train_losses, test_losses, model, X_train
+
