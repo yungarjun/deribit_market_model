@@ -413,3 +413,60 @@ def remove_option_price_jumps(C_df: pd.DataFrame,
               f"({100.0*len(drop_times)/len(C):.1f}%) "
               f"[rel_thr={rel_thr:.2f}, k_mad={k_mad:.1f}, frac_nodes>{frac_nodes:.2%}]")
     return C_df.loc[~C_df.index.isin(drop_times)].copy()
+
+# Bid-ask spread l1 weighted repair 
+def projection_spread_weighted_l1_cvxpy(C_mid: pd.DataFrame,
+                                        C_bid: pd.DataFrame,
+                                        C_ask: pd.DataFrame,
+                                        A: sp.csr_matrix,
+                                        b: np.ndarray,
+                                        delta_floor: float = 1e-8,
+                                        solver: str = "OSQP") -> pd.DataFrame:
+    """
+    Spread-weighted L1 projection:
+      min sum_i w+_i * ep_i + w-_i * em_i
+      s.t. c = c_raw + ep - em, A c >= b, 0 <= c <= 1
+    where w+ = 1/max(ask-mid, delta_floor), w- = 1/max(mid-bid, delta_floor).
+    All inputs must share the same (time x nodes) shape and columns order.
+    """
+    assert list(C_mid.columns) == list(C_bid.columns) == list(C_ask.columns)
+    assert C_mid.index.equals(C_bid.index) and C_mid.index.equals(C_ask.index)
+
+    cols = C_mid.columns
+    n = len(cols)
+
+    # half-spreads in normalized units
+    d_bid = (C_mid - C_bid).clip(lower=0.0).astype(float).values
+    d_ask = (C_ask - C_mid).clip(lower=0.0).astype(float).values
+
+    # weights: larger spread -> smaller penalty
+    wminus_all = 1.0 / np.maximum(d_bid, delta_floor)   # down moves (toward bid): epsilon_minus
+    wplus_all  = 1.0 / np.maximum(d_ask, delta_floor)   # up moves   (toward ask): epsilon_plus
+
+    # cvxpy LP
+    c_raw = cp.Parameter(n)
+    wplus = cp.Parameter(n, nonneg=True)
+    wminus = cp.Parameter(n, nonneg=True)
+
+    c = cp.Variable(n)
+    ep = cp.Variable(n, nonneg=True)  # upward adjustment
+    em = cp.Variable(n, nonneg=True)  # downward adjustment
+
+    constraints = [
+        c == c_raw + ep - em,
+        A @ c >= b,
+        c >= 0, c <= 1
+    ]
+    objective = cp.Minimize(wplus @ ep + wminus @ em)
+    prob = cp.Problem(objective, constraints)
+
+    out = []
+    for i, row in enumerate(C_mid.values):
+        c_raw.value = row
+        wplus.value = wplus_all[i]
+        wminus.value = wminus_all[i]
+        prob.solve(solver=solver, warm_start=True, eps_abs=1e-6, eps_rel=1e-6, verbose=False)
+        out.append(c.value if c.value is not None else row)
+
+    C_arb = np.vstack(out)
+    return pd.DataFrame(C_arb, index=C_mid.index, columns=cols)

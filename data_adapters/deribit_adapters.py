@@ -38,6 +38,10 @@ def clean_deribit(df: pd.DataFrame, reference_date, r=0.0, q=0.0,
     df['m'] = np.log(df['strike'] / df['F'])
     df['c_norm'] = df['mid_price'] * np.exp(-(r - q) * df['tau'])  # (C/S)*S/F = C/F
 
+    # add normalised bid/ask spread
+    df['c_bid_norm'] = df['best_bid_price'] * np.exp(-(r - q) * df['tau'])
+    df['c_ask_norm'] = df['best_ask_price'] * np.exp(-(r - q) * df['tau'])   
+
     # Timestamps to pandas datetime (Deribit is ms since epoch typically)
     if np.issubdtype(df['timestamp'].dtype, np.number):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
